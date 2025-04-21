@@ -104,6 +104,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
     _added_data_files: List[DataFile]
     _manifest_num_counter: itertools.count[int]
     _deleted_data_files: Set[DataFile]
+    _scc: SnapshotSummaryCollector
 
     def __init__(
         self,
@@ -113,6 +114,8 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         commit_uuid: Optional[uuid.UUID] = None,
         snapshot_properties: Dict[str, str] = EMPTY_DICT,
     ) -> None:
+        from pyiceberg.table import TableProperties
+
         super().__init__(transaction)
         self.commit_uuid = commit_uuid or uuid.uuid4()
         self._io = io
@@ -126,6 +129,13 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         self._deleted_data_files = set()
         self.snapshot_properties = snapshot_properties
         self._manifest_num_counter = itertools.count(0)
+        self._ssc = SnapshotSummaryCollector()
+        partition_summary_limit = int(
+            self._transaction.table_metadata.properties.get(
+                TableProperties.WRITE_PARTITION_SUMMARY_LIMIT, TableProperties.WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT
+            )
+        )
+        self._ssc.set_partition_summary_limit(partition_summary_limit)
 
     def append_data_file(self, data_file: DataFile) -> _SnapshotProducer[U]:
         self._added_data_files.append(data_file)
@@ -201,18 +211,8 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         return self._process_manifests(added_manifests.result() + delete_manifests.result() + existing_manifests.result())
 
     def _summary(self, snapshot_properties: Dict[str, str] = EMPTY_DICT) -> Summary:
-        from pyiceberg.table import TableProperties
-
-        ssc = SnapshotSummaryCollector()
-        partition_summary_limit = int(
-            self._transaction.table_metadata.properties.get(
-                TableProperties.WRITE_PARTITION_SUMMARY_LIMIT, TableProperties.WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT
-            )
-        )
-        ssc.set_partition_summary_limit(partition_summary_limit)
-
         for data_file in self._added_data_files:
-            ssc.add_file(
+            self._ssc.add_file(
                 data_file=data_file,
                 partition_spec=self._transaction.table_metadata.spec(),
                 schema=self._transaction.table_metadata.schema(),
@@ -221,7 +221,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         if len(self._deleted_data_files) > 0:
             specs = self._transaction.table_metadata.specs()
             for data_file in self._deleted_data_files:
-                ssc.remove_file(
+                self._ssc.remove_file(
                     data_file=data_file,
                     partition_spec=specs[data_file.spec_id],
                     schema=self._transaction.table_metadata.schema(),
@@ -234,7 +234,7 @@ class _SnapshotProducer(UpdateTableMetadata[U], Generic[U]):
         )
 
         return update_snapshot_summaries(
-            summary=Summary(operation=self._operation, **ssc.build(), **snapshot_properties),
+            summary=Summary(operation=self._operation, **self._ssc.build(), **snapshot_properties),
             previous_summary=previous_snapshot.summary if previous_snapshot is not None else None,
         )
 
